@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Relay — AI Worker</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Relay home"><span class="brand-mark">↗</span> relay<span class="brand-dot">.</span></a>
+    <div class="workspace-name"><span class="avatar">AR</span><div>Personal workspace<small>Local computer</small></div><span class="local-dot"></span></div>
+    <div class="nav-label">WORKSPACE</div>
+    <nav aria-label="Main navigation">
+      <button id="nav-worker" class="nav-item active" aria-label="AI worker"><span aria-hidden="true">◈</span> AI worker <span class="nav-tag">BETA</span></button>
+      <button id="nav-files" class="nav-item" aria-label="Files"><span aria-hidden="true">▤</span> Files</button>
+      <a class="nav-item" href="/demo" target="_blank" rel="noopener"><span>▦</span> Practice workspace <span>↗</span></a>
+    </nav>
+    <div class="nav-label recent-label">RECENT RUNS <button id="new-run" title="New task" aria-label="New task">+</button></div>
+    <div id="history" class="history"><p class="muted small">Your runs will appear here.</p></div>
+    <div class="sidebar-bottom"><span class="status-dot"></span> Runs on your computer<button id="setup-open">Setup ↗</button></div>
+  </aside>
+
+  <main>
+    <header class="topbar"><span>Workspace <span class="slash">/</span> <strong id="view-title">AI worker</strong></span><div><span id="connection" class="pill">Connecting</span><span class="profile">A</span></div></header>
+
+    <section id="worker-view" class="view">
+      <div class="page-heading"><div><div class="eyebrow">YOUR LOCAL AI WORKER</div><h1>Give it the goal.<br><span>Watch it get to work.</span></h1><p>Browser actions, files, and follow-through. One task at a time.</p></div><span class="heading-symbol" aria-hidden="true">✳</span></div>
+
+      <div class="work-grid">
+        <div class="main-column">
+          <form id="task-form" class="card composer">
+            <div class="card-heading"><h2>What would you like done?</h2><span class="small muted">Natural language → action</span></div>
+            <label class="sr-only" for="task">Your task</label>
+            <textarea id="task" rows="4" placeholder="Describe the outcome. The worker will figure out the steps…" required maxlength="12000"></textarea>
+            <div class="task-options"><div class="field"><label for="start-url">Starting website <span class="muted">optional</span></label><input id="start-url" placeholder="https://… or your local app" type="url"></div><div class="field provider-field"><label for="provider">Execution mode</label><select id="provider"><option value="gemini">Gemini · live AI</option><option value="demo">Scripted demo · no key</option></select></div></div>
+            <div class="composer-footer"><span id="mode-note" class="small muted">Browser and workspace tools enabled</span><div><button id="stop-run" type="button" class="button danger hidden">Stop</button><button id="start-run" class="button primary" type="submit">Start task <span>↗</span></button></div></div>
+          </form>
+
+          <div class="examples-heading"><span>START WITH A SAMPLE</span><span>Use Gemini for your own tasks</span></div>
+          <div class="examples"><button id="example-browser" class="example"><span class="example-icon blue">▦</span><strong>Work in a browser</strong><span>Create and verify a task in the practice app.</span><span class="example-arrow">↗</span></button><button id="example-files" class="example"><span class="example-icon peach">▤</span><strong>Work with files</strong><span>Read a brief, prepare a summary, and save it.</span><span class="example-arrow">↗</span></button></div>
+
+          <section id="pending-panel" class="card pending hidden" aria-live="polite"></section>
+          <section id="outcome" class="card outcome hidden" aria-live="polite"></section>
+
+          <section class="card activity-card">
+            <div class="card-heading"><h2>Activity</h2><div><span id="run-status" class="pill">Ready</span><a id="download-report" class="text-link hidden" href="#">Export run</a></div></div>
+            <div class="activity-meta"><span id="run-meta">Each action leaves a trail.</span><span id="tool-count">0 actions</span></div>
+            <div id="activity" class="activity"><div class="empty-state"><span class="empty-icon">⌁</span><h3>A clear view of the work.</h3><p>Plans, tool calls, observations, and verification<br>will appear here when you start a task.</p></div></div>
+          </section>
+        </div>
+
+        <aside class="inspector">
+          <section class="card environment-card"><div class="card-heading"><h2>Computer view</h2><span id="browser-state" class="small muted">Idle</span></div><div class="view-tabs" role="tablist" aria-label="Observation view"><button id="show-screen" class="selected" role="tab" aria-selected="true">Browser</button><button id="show-structure" role="tab" aria-selected="false">Page structure</button></div><div class="address-bar"><span>◉</span><span id="observed-url">No page open</span></div><div id="screen-view" class="screen-view"><img id="browser-image" class="hidden" alt="Latest screenshot from the worker’s browser"><div id="screen-empty"><span>▦</span><p>The worker’s browser appears here.</p><small>A separate, fresh browser session for every run.</small></div></div><pre id="structure-view" class="structure hidden">Page observations will appear here.</pre><div class="environment-footer"><span class="status-dot"></span> Actual browser observations</div></section>
+          <section class="card"><div class="card-heading"><h2>Plan</h2><span class="small muted">Adapts as it works</span></div><ol id="plan" class="plan"><li class="muted">Waiting for a task.</li></ol></section>
+          <section class="card"><div class="card-heading"><h2>Task memory</h2><span class="small muted">Discovered facts</span></div><dl id="memory" class="memory"><div class="muted small">Relevant facts stay with this run.</div></dl></section>
+          <div class="scope-note"><span>◇</span><p>Files stay inside the workspace folder. External browser interactions and file changes pause for your review.</p></div>
+        </aside>
+      </div>
+      <footer class="page-footer"><span>relay. <span class="muted">An observable worker, on your computer.</span></span><span id="model-label">Local prototype</span></footer>
+    </section>
+
+    <section id="files-view" class="view hidden"><div class="page-heading"><div><div class="eyebrow">THE WORKER’S FILES</div><h1>A workspace<br><span>you can inspect.</span></h1><p>Add text files or open files created by a run.</p></div></div><div class="card files-card"><div class="card-heading"><h2 id="folder-label">Workspace /</h2><button id="upload-button" class="button primary">Add text file</button><input id="upload-file" type="file" accept=".txt,.md,.json,.csv,.tsv,.log,.html,.js,.css" class="hidden"></div><p id="workspace-path" class="path-label"></p><button id="parent-folder" class="text-link hidden">← Parent folder</button><div id="file-list"></div><p class="small muted file-note">Uploads are saved under imports/. You can also copy files directly into the folder above. Text files up to 128 KB can be uploaded here.</p></div></section>
+  </main>
+
+  <dialog id="setup-dialog"><div class="dialog-heading"><h2>Connect your worker</h2><button id="setup-close" aria-label="Close setup">×</button></div><p>The scripted demos work immediately. For arbitrary tasks, create a Gemini key in <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio ↗</a>.</p><ol><li>Copy <code>.env.example</code> to <code>.env</code>.</li><li>Set <code>GEMINI_API_KEY=your_key</code>.</li><li>Restart with <code>npm start</code>.</li></ol><pre>npm install
+npm run setup:browser
+npm start</pre><p id="setup-state" class="small muted"></p><p class="small muted">Observed page and file content is sent to Gemini in live mode. This prototype supports websites and scoped text files; native desktop apps, PDF OCR, and arbitrary shell commands are outside its current toolset.</p></dialog>
+  <dialog id="file-dialog"><div class="dialog-heading"><h2 id="file-title">File</h2><button id="file-close" aria-label="Close file">×</button></div><pre id="file-content"></pre></dialog>
+  <div id="toast" role="status" class="toast hidden"></div>
+</body>
+</html>

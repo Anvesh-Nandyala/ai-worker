@@ -1,0 +1,19 @@
+{
+  "name": "relay-ai-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A local, tool-using computer agent with Gemini, browser automation, workspace files, approvals and evidence.",
+  "type": "module",
+  "engines": { "node": ">=22.9.0" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
+    "test": "node --test test/*.test.js",
+    "test:e2e": "node scripts/smoke.js",
+    "setup:browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "@google/genai": "1.52.0",
+    "playwright": "1.64.1"
+  }
+}
