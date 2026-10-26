@@ -52,6 +52,31 @@ export class ComputerBrowser {
     return locator;
   }
 
+  async checkTableRow(name, expectedJSON) {
+    let fields;
+    try { fields = JSON.parse(expectedJSON); } catch { throw new Error('Expected must be a JSON object mapping table column headings to exact cell text'); }
+    if (!fields || Array.isArray(fields) || typeof fields !== 'object' || !Object.keys(fields).length || Object.keys(fields).length > 12 || Object.entries(fields).some(([key, value]) => !key.trim() || typeof value !== 'string' || !value.trim() || value.length > 1000)) throw new Error('Specify between 1 and 12 column headings with nonempty text values');
+    const table = await this.target('table', name);
+    if (!await table.isVisible()) throw new Error('The requested table is not visible; open its section first');
+    const rows = table.getByRole('row');
+    if (await rows.count() > 501) throw new Error('Table exceeds 500 rows; filter it before verifying');
+    const headers = await table.getByRole('columnheader').allTextContents();
+    const normalize = value => value.replace(/\s+/g, ' ').trim();
+    const columns = Object.keys(fields).map(key => {
+      const matches = headers.map((value, index) => normalize(value) === normalize(key) ? index : -1).filter(index => index >= 0);
+      if (matches.length !== 1) throw new Error('Expected one column headed ' + key + '; inspect the table');
+      return matches[0];
+    });
+    const values = Object.values(fields).map(normalize);
+    const matches = [];
+    for (const row of await rows.all()) {
+      if (!await row.isVisible()) continue;
+      const cells = await row.getByRole('cell').allTextContents();
+      if (columns.every((column, index) => normalize(cells[column] || '') === values[index])) matches.push(Object.fromEntries(Object.keys(fields).map((key, index) => [key, cells[columns[index]]])));
+    }
+    return { passed: matches.length === 1, actual: JSON.stringify({ matchingRows: matches.length, rows: matches.slice(0, 3) }) };
+  }
+
   async close() {
     await this.browser?.close();
   }

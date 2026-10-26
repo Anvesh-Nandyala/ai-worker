@@ -6,6 +6,8 @@ let lastEventCount = -1;
 let lastPendingToken;
 let lastImageVersion;
 let folder = '.';
+let parentFolder = '.';
+let fileLoadVersion = 0;
 let pollBusy = false;
 
 async function api(url, options = {}) {
@@ -40,16 +42,31 @@ function switchView(name) {
 
 function choosePreset(scenario) {
   selectedScenario = scenario;
+  if (config.presets[scenario].aiOnly && $('#provider').value === 'demo') {
+    $('#provider').value = config.defaultProvider === 'gemini' ? 'gemini' : 'ollama';
+    updateMode();
+  }
   $('#task').value = config.presets[scenario].task;
-  $('#start-url').value = scenario === 'browser' || $('#provider').value === 'demo' ? config.demoURL : '';
+  $('#start-url').value = scenario === 'invoice' ? config.demoURL + '#invoices' : scenario === 'browser' || $('#provider').value === 'demo' ? config.demoURL : '';
   switchView('worker');
   $('#task').focus();
 }
 
 function updateMode() {
-  const demo = $('#provider').value === 'demo';
-  $('#mode-note').textContent = demo ? 'Scripted scenario · choose one of the two samples' : 'Live Gemini · external actions pause for review';
-  if (demo && !Object.values(config.presets).some(preset => preset.task === $('#task').value)) choosePreset(selectedScenario);
+  const provider = $('#provider').value;
+  const demo = provider === 'demo';
+  $('#mode-note').textContent = demo ? 'Scripted scenario · choose one of the two samples' : provider === 'ollama' ? 'Local Ollama · no API key or cloud quota' : 'Live Gemini · external actions pause for review';
+  $('#model-label').textContent = provider === 'ollama' ? 'Local · ' + config.ollamaModel : demo ? 'Scripted demo' : config.model;
+  if (provider === 'ollama') checkOllama().catch(error => toast(error.message));
+  if (demo && !Object.values(config.presets).some(preset => !preset.aiOnly && preset.task === $('#task').value)) choosePreset(config.presets[selectedScenario]?.aiOnly ? 'browser' : selectedScenario);
+}
+
+async function checkOllama() {
+  $('#ollama-state').textContent = 'Checking local Ollama…';
+  const status = await api('/api/ollama/status');
+  $('#ollama-state').textContent = status.ready ? 'Ollama ready · ' + status.model + ' · runs locally on your computer' : status.error;
+  if ($('#provider').value === 'ollama') $('#mode-note').textContent = status.ready ? 'Local Ollama ready · ' + status.model : 'Ollama needs setup · open Setup';
+  return status;
 }
 
 function resetRun() {
@@ -190,6 +207,7 @@ function renderRun(run) {
     outcome.replaceChildren(node('span', 'eyebrow', run.status === 'completed' ? 'COMPLETED WITH CHECKED EVIDENCE' : 'RUN ' + run.status.toUpperCase()));
     outcome.append(node('h2', '', run.status === 'completed' ? 'The work is ready.' : 'The task needs attention.'));
     outcome.append(node('p', '', run.error || run.summary || 'No completion summary available.'));
+    for (const note of run.notes || []) outcome.append(node('p', 'small muted', note));
     for (const item of run.evidence || []) {
       const evidence = node('details', 'evidence-item');
       evidence.append(node('summary', '', `${item.passed ? '✓' : '!'} ${item.id} · ${item.kind.replaceAll('_', ' ')} ${item.target}`));
@@ -234,10 +252,16 @@ async function poll() {
   } finally { pollBusy = false; }
 }
 
-async function loadFiles() {
-  const data = await api('/api/workspace?path=' + encodeURIComponent(folder));
-  $('#folder-label').textContent = 'Workspace / ' + (folder === '.' ? '' : folder);
-  $('#parent-folder').classList.toggle('hidden', folder === '.');
+async function loadFiles(requested = folder) {
+  const version = ++fileLoadVersion;
+  const inputAtStart = $('#folder-path').value;
+  const data = await api('/api/workspace?path=' + encodeURIComponent(requested));
+  if (version !== fileLoadVersion) return;
+  folder = data.path;
+  parentFolder = data.parent;
+  $('#folder-label').textContent = config.fileAccess === 'all' ? 'Folder: ' + folder : 'Workspace / ' + (folder === '.' ? '' : folder);
+  if ($('#folder-path').value === inputAtStart) $('#folder-path').value = folder;
+  $('#parent-folder').classList.toggle('hidden', parentFolder === folder);
   const list = $('#file-list');
   list.replaceChildren();
   for (const file of data.entries) {
@@ -245,11 +269,11 @@ async function loadFiles() {
     button.append(node('span', 'file-icon', file.type === 'directory' ? '▰' : '▤'), node('span', '', file.name), node('span', 'muted', file.type === 'directory' ? 'Open folder →' : 'Read file ↗'));
     button.onclick = async () => {
       try {
-        if (file.type === 'directory') { folder = file.path; await loadFiles(); }
+        if (file.type === 'directory') await loadFiles(file.path);
         else {
           const data = await api('/api/workspace/file?path=' + encodeURIComponent(file.path));
           $('#file-title').textContent = data.path;
-          $('#file-content').textContent = data.content + (data.truncated ? '\n\n[Display truncated]' : '');
+          $('#file-content').textContent = (data.calculation ? data.calculation + '\n\n' : '') + (data.warnings?.length ? data.warnings.join('\n') + '\n\n' : '') + data.content + (data.truncated ? '\n\n[Preview truncated. Supply a smaller document or request a smaller spreadsheet range.]' : '');
           $('#file-dialog').showModal();
         }
       } catch (error) { toast(error.message); }
@@ -262,12 +286,16 @@ async function init() {
   config = await api('/api/config');
   $('#connection').textContent = 'Local runtime connected';
   $('#model-label').textContent = config.model;
-  $('#provider').value = config.hasApiKey ? 'gemini' : 'demo';
-  $('#workspace-path').textContent = config.workspace;
-  $('#setup-state').textContent = config.hasApiKey ? 'API key configured. Model: ' + config.model : 'No API key configured. The two scripted demos are ready to use.';
+  $('#provider').value = config.defaultProvider || (config.hasApiKey ? 'gemini' : 'demo');
+  const allFiles = config.fileAccess === 'all';
+  $('#workspace-path').textContent = (allFiles ? 'All files enabled · Default workspace: ' : '') + config.workspace;
+  $('#folder-form').classList.toggle('hidden', !allFiles);
+  $('#file-access-note').textContent = allFiles ? 'File access: all locations allowed by your OS account. File changes and external browser interactions pause for review.' : 'Files stay inside the workspace folder. External browser interactions and file changes pause for your review.';
+  $('#setup-state').textContent = config.hasApiKey ? 'Optional Gemini connection: API key configured · ' + config.model : 'Optional Gemini connection: no API key configured. Ollama and scripted demos do not need one.';
   $('#provider').onchange = updateMode;
   $('#example-browser').onclick = () => choosePreset('browser');
   $('#example-files').onclick = () => choosePreset('files');
+  $('#example-invoice').onclick = () => choosePreset('invoice');
   $('#nav-worker').onclick = () => switchView('worker');
   $('#nav-files').onclick = () => switchView('files');
   $('#new-run').onclick = () => { resetRun(); switchView('worker'); $('#task').value = ''; $('#task').focus(); };
@@ -285,18 +313,38 @@ async function init() {
     catch (error) { toast(error.message); }
   };
   $('#setup-open').onclick = () => $('#setup-dialog').showModal();
+  $('#ollama-check').onclick = () => checkOllama().catch(error => toast(error.message));
   $('#setup-close').onclick = () => $('#setup-dialog').close();
   $('#file-close').onclick = () => $('#file-dialog').close();
-  $('#parent-folder').onclick = () => { folder = folder.includes('/') ? folder.slice(0, folder.lastIndexOf('/')) : '.'; loadFiles().catch(error => toast(error.message)); };
+  $('#parent-folder').onclick = () => loadFiles(parentFolder).catch(error => toast(error.message));
+  $('#folder-form').onsubmit = event => {
+    event.preventDefault();
+    loadFiles($('#folder-path').value.trim() || '.').catch(error => toast(error.message));
+  };
+  $('#home-folder').onclick = () => loadFiles(config.homeDirectory).catch(error => toast(error.message));
+  $('#workspace-folder').onclick = () => loadFiles('.').catch(error => toast(error.message));
   $('#upload-button').onclick = () => $('#upload-file').click();
   $('#upload-file').onchange = async event => {
     const file = event.target.files[0];
     if (!file) return;
     try {
-      if (file.size > 128 * 1024) throw new Error('Upload a text file under 128 KB');
-      await api('/api/workspace/upload', { method: 'POST', body: JSON.stringify({ filename: file.name, content: await file.text() }) });
-      folder = 'imports';
-      await loadFiles();
+      const office = /\.(pdf|docx?|xlsx?|ods|odt|rtf|pptx?|odp)$/i.test(file.name);
+      let upload;
+      if (office) {
+        if (file.size > 16 * 1024 * 1024) throw new Error('Upload a document no larger than 16 MB');
+        const dataURL = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(new Error('Could not read the selected file'));
+          reader.readAsDataURL(file);
+        });
+        upload = { filename: file.name, encoding: 'base64', data: dataURL.slice(dataURL.indexOf(',') + 1) };
+      } else {
+        if (file.size > 128 * 1024) throw new Error('Upload a text file under 128 KB');
+        upload = { filename: file.name, content: await file.text() };
+      }
+      await api('/api/workspace/upload', { method: 'POST', body: JSON.stringify(upload) });
+      await loadFiles('imports');
       toast('File added to imports/');
     } catch (error) { toast(error.message); }
     event.target.value = '';

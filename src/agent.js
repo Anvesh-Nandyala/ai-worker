@@ -4,6 +4,9 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ComputerBrowser, webURL } from './browser.js';
 import { GeminiProvider, PRESETS } from './providers.js';
+import { OllamaProvider } from './ollama.js';
+import { FileViewer } from './file-viewer.js';
+import { assertTextWrite } from './document-formats.js';
 import { declarations, validateTool, SYSTEM } from './tools.js';
 
 export class Run {
@@ -21,6 +24,7 @@ export class Run {
     this.memory = Object.create(null);
     this.evidence = [];
     this.plan = [];
+    this.notes = [];
     this.browserRevision = 0;
     this.fileRevision = 0;
     this.turns = 0;
@@ -28,6 +32,7 @@ export class Run {
     this.abort = new AbortController();
     this.directory = path.join(manager.runsDirectory, this.id);
     this.persistChain = Promise.resolve();
+    this.fileViewer = new FileViewer(manager.workspace);
   }
 
   view() {
@@ -35,10 +40,10 @@ export class Run {
       id: this.id, task: this.task, startURL: this.startURL, provider: this.provider,
       status: this.status, createdAt: this.createdAt, completedAt: this.completedAt,
       maxTurns: this.maxTurns, turns: this.turns, toolCalls: this.toolCalls,
-      events: this.events, memory: this.memory, plan: this.plan,
+      events: this.events, memory: this.memory, plan: this.plan, notes: this.notes,
       evidence: this.evidence, pending: this.pending, observation: this.observation,
       screenshotVersion: this.screenshotVersion, summary: this.summary, error: this.error,
-      model: this.provider === 'gemini' ? this.manager.config.model : 'scripted demo'
+      model: this.provider === 'demo' ? 'scripted demo' : this.provider === 'ollama' ? this.manager.config.ollamaModel : this.manager.config.model
     };
   }
 
@@ -143,9 +148,18 @@ export class Run {
       } else if (name === 'ask_user') {
         output = { answer: await this.request('question', args.question, {}, args.options) };
       } else if (name === 'file_list') output = { entries: await this.manager.workspace.list(args.path) };
-      else if (name === 'file_read') output = await this.manager.workspace.read(args.path);
-      else if (name === 'file_search') output = await this.manager.workspace.search(args.query);
+      else if (name === 'file_read') output = await this.manager.workspace.read(args.path, { signal: this.abort.signal });
+      else if (name === 'spreadsheet_read') output = await this.manager.workspace.spreadsheet(args.path, { sheet: args.sheet, range: args.range, signal: this.abort.signal });
+      else if (name === 'file_search') output = await this.manager.workspace.search(args.query, args.path, { signal: this.abort.signal });
+      else if (name === 'file_open' || name === 'file_open_pdf') {
+        if (name === 'file_open_pdf') {
+          const actual = await this.fileViewer.inspect(args.path, this.abort.signal);
+          if (!/\.pdf$/i.test(args.path) || !/\.pdf$/i.test(actual.filename)) throw new Error('file_open_pdf requires a .pdf file; use file_open for other document types');
+        }
+        output = await this.fileViewer.open(args.path, this.abort.signal);
+      }
       else if (name === 'file_write') {
+        assertTextWrite(args.path);
         await this.manager.workspace.resolve(args.path);
         if (Buffer.byteLength(args.content) > 128 * 1024) throw new Error('Content exceeds 128 KB');
         let before;
@@ -154,7 +168,7 @@ export class Run {
         if (before && !args.overwrite) throw new Error('File exists. Inspect it and ask to overwrite or choose a new path.');
         if (before?.content === args.content && !before.truncated) output = { path: args.path, unchanged: true };
         else {
-          await this.approve(before ? 'Replace this workspace file?' : 'Create this workspace file?', { ...args, existingContent: before?.content });
+          await this.approve(before ? 'Replace this file?' : 'Create this file?', { ...args, resolvedPath: await this.manager.workspace.resolve(args.path), existingContent: before?.content });
           if (before) {
             const current = await this.manager.workspace.read(args.path);
             if (current.content !== before.content || current.truncated) throw new Error('File changed during review; read it again');
@@ -165,7 +179,7 @@ export class Run {
       } else if (name === 'file_move') {
         await this.manager.workspace.resolve(args.source);
         await this.manager.workspace.resolve(args.destination);
-        await this.approve('Move this workspace file?', args);
+        await this.approve('Move this file?', { ...args, resolvedSource: await this.manager.workspace.resolve(args.source), resolvedDestination: await this.manager.workspace.resolve(args.destination) });
         output = await this.manager.workspace.move(args.source, args.destination);
         this.fileRevision++;
       } else if (name === 'verify') output = await this.verify(args);
@@ -182,6 +196,7 @@ export class Run {
         } else {
           this.browserRevision++;
           if (name === 'browser_navigate') await this.computer.navigate(args.url);
+          else if (name === 'browser_reload') await this.computer.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
           else if (name === 'browser_click') await (await this.computer.target(args.role, args.name)).click();
           else if (name === 'browser_fill') {
             if (!['textbox', 'searchbox', 'spinbutton'].includes(args.role)) throw new Error('Fill supports textbox, searchbox or spinbutton');
@@ -198,6 +213,7 @@ export class Run {
         }
       } else throw new Error('Tool is not implemented');
       this.check();
+      if (output.calculation && !this.notes.includes(output.calculation)) this.notes.push(output.calculation);
       this.log('observation', name === 'verify' ? (output.passed ? 'Verification passed' : 'Verification failed') : 'Tool result', output);
       return output;
     } catch (error) {
@@ -209,15 +225,27 @@ export class Run {
   }
 
   async verify({ kind, target, expected }) {
-    if (kind !== 'file_exists' && !expected.trim()) throw new Error('Verification requires a meaningful expected value');
+    if (!['file_exists', 'file_opened'].includes(kind) && !expected.trim()) throw new Error('Verification requires a meaningful expected value');
     let actual = '';
     let passed = false;
     const scope = kind.startsWith('file_') ? 'file' : 'browser';
     const check = async () => {
+      if (kind === 'browser_table_row') {
+        const result = await this.computer.checkTableRow(target, expected);
+        actual = result.actual;
+        passed = result.passed;
+        return;
+      }
+      if (kind === 'file_opened') {
+        const result = await this.fileViewer.verify(target, this.abort.signal);
+        actual = result.actual;
+        passed = result.passed;
+        return;
+      }
       if (kind === 'browser_text') actual = await this.computer.page.locator('body').innerText();
       if (kind === 'browser_url') actual = this.computer.page.url();
       if (kind === 'browser_field') actual = await (await this.computer.target('textbox', target)).inputValue();
-      if (kind === 'file_contains') actual = (await this.manager.workspace.read(target)).content;
+      if (kind === 'file_contains') actual = (await this.manager.workspace.read(target, { signal: this.abort.signal })).content;
       if (kind === 'file_exists') {
         try { actual = (await fs.stat(await this.manager.workspace.resolve(target))).isFile() ? 'exists' : 'not a file'; }
         catch (error) { if (error.code !== 'ENOENT') throw error; actual = 'missing'; }
@@ -291,7 +319,7 @@ export class Run {
   async start() {
     this.status = 'running';
     await fs.mkdir(this.directory, { recursive: true });
-    this.log('status', this.provider === 'demo' ? 'Scripted demo started — no model calls' : 'Gemini worker started', { model: this.provider === 'gemini' ? this.manager.config.model : undefined });
+    this.log('status', this.provider === 'demo' ? 'Scripted demo started — no model calls' : this.provider === 'ollama' ? 'Local Ollama worker started' : 'Gemini worker started', { model: this.view().model });
     const timeout = setTimeout(() => this.abort.abort(new Error('Run time limit reached')), this.manager.config.maxMinutes * 60000);
     timeout.unref();
     try {
@@ -307,23 +335,37 @@ export class Run {
       this.log('observation', 'Initial environment', { browser: await this.observe(), workspace: await this.manager.workspace.list('.') });
       if (this.provider === 'demo') await this.runDemo();
       else {
-        const providerOptions = { apiKey: this.manager.config.apiKey, model: this.manager.config.model, onRetry: data => this.log('retry', 'Model busy; retrying with backoff', data) };
-        const provider = this.manager.providerFactory ? this.manager.providerFactory(providerOptions) : new GeminiProvider(providerOptions);
+        const providerOptions = this.provider === 'ollama' ? {
+          provider: this.provider, model: this.manager.config.ollamaModel, baseURL: this.manager.config.ollamaBaseURL,
+          timeout: this.manager.config.ollamaTimeout, contextSize: this.manager.config.ollamaContextSize
+        } : { provider: this.provider, apiKey: this.manager.config.apiKey, model: this.manager.config.model, onRetry: data => this.log('retry', 'Model busy; retrying with backoff', data) };
+        const provider = this.manager.providerFactory ? this.manager.providerFactory(providerOptions) : this.provider === 'ollama' ? new OllamaProvider(providerOptions) : new GeminiProvider(providerOptions);
         const contents = [{ role: 'user', parts: [{ text: JSON.stringify({ task: this.task, browser: this.observation, workspace: await this.manager.workspace.list('.') }) }] }];
+        let completionReminders = 0;
         while (this.turns < this.maxTurns && this.status !== 'completed') {
           this.check();
           this.turns++;
           this.log('thinking', 'Choosing the next action', { turn: this.turns });
           const response = await provider.generate(contents, {
-            systemInstruction: SYSTEM + '\nTask memory: ' + JSON.stringify(this.memory),
+            systemInstruction: SYSTEM + '\nFile access: ' + JSON.stringify({
+              mode: this.manager.workspace.allowAllFiles ? 'all' : 'workspace',
+              defaultDirectory: this.manager.workspace.root,
+              homeDirectory: this.manager.workspace.allowAllFiles ? this.manager.workspace.home : undefined
+            }) + '\nTask memory: ' + JSON.stringify(this.memory),
             tools: [{ functionDeclarations: declarations }],
             maxOutputTokens: 4096
           }, this.abort.signal);
           const content = response.candidates?.[0]?.content;
-          if (!content) throw new Error('Model returned no usable content; inspect project quota, safety settings or model availability');
+          if (!content) throw new Error('Model returned no usable content. Check the selected provider’s model and connection.');
           contents.push(content);
           const calls = response.functionCalls || [];
           if (!calls.length) {
+            if (this.provider === 'ollama' && completionReminders < 1 && this.turns < this.maxTurns) {
+              completionReminders++;
+              this.log('status', 'Requesting verified completion', { reason: 'The local model returned text without a tool call.' });
+              contents.push({ role: 'user', parts: [{ text: 'Continue using the available tools. A written promise to verify is not a tool call. Check the requested facts or outcome with verify against actual state, then call finish with current passed evidence IDs. If the tools cannot complete this task, state the specific limitation. Do not invent evidence or claim unverified completion.' }] });
+              continue;
+            }
             this.status = 'blocked';
             this.summary = response.text || 'The model stopped without verified completion.';
             this.log('blocked', 'Stopped without verified completion', { message: this.summary });
@@ -380,11 +422,11 @@ export class RunManager {
   create(options) {
     if (this.active) throw new Error('A worker is already active. Stop or finish it before starting another.');
     if (typeof options.task !== 'string' || !options.task.trim() || options.task.length > 12000) throw new Error('Enter a task under 12,000 characters');
-    if (!['gemini', 'demo'].includes(options.provider)) throw new Error('Choose Gemini or scripted demo');
+    if (!['gemini', 'ollama', 'demo'].includes(options.provider)) throw new Error('Choose Ollama, Gemini or scripted demo');
     if (options.startURL) webURL(options.startURL);
     if (options.provider === 'gemini' && !this.config.apiKey) throw new Error('Set GEMINI_API_KEY in .env and restart, or choose a scripted demo');
     if (options.provider === 'demo') {
-      if (!PRESETS[options.scenario] || options.task !== PRESETS[options.scenario].task) throw new Error('Scripted demo only supports its two preset tasks. Choose a preset or use Gemini for your own task.');
+      if (!PRESETS[options.scenario] || PRESETS[options.scenario].aiOnly || options.task !== PRESETS[options.scenario].task) throw new Error('Scripted demo supports the browser and file samples. Use Ollama or Gemini for the invoice workflow or your own task.');
       options.startURL = this.baseURL + '/demo';
     }
     const run = new Run(this, { ...options, task: options.task.trim() });

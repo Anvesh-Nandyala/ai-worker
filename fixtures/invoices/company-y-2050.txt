@@ -1,0 +1,7 @@
+SAMPLE INVOICE - fictional data for the local practice app
+Company: Company Y
+Invoice number: CY-2050
+Invoice date: 2026-10-24
+Amount due: INR 7200.00
+Due date: 2026-11-23
+Description: Equipment maintenance

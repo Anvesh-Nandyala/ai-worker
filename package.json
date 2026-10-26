@@ -2,18 +2,26 @@
   "name": "relay-ai-worker",
   "version": "1.0.0",
   "private": true,
-  "description": "A local, tool-using computer agent with Gemini, browser automation, workspace files, approvals and evidence.",
+  "description": "A tool-using computer agent with local Ollama or cloud Gemini, browser automation, files, approvals and evidence.",
   "type": "module",
-  "engines": { "node": ">=22.9.0" },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --env-file-if-exists=.env --watch server.js",
     "test": "node --test test/*.test.js",
     "test:e2e": "node scripts/smoke.js",
+    "test:invoice:ai": "node --env-file-if-exists=.env scripts/check-invoice-ai.js",
     "setup:browser": "playwright install chromium"
   },
   "dependencies": {
     "@google/genai": "1.52.0",
-    "playwright": "1.64.1"
+    "fast-xml-parser": "5.11.2",
+    "fflate": "0.8.3",
+    "mammoth": "1.13.0",
+    "pdfjs-dist": "6.4.299",
+    "playwright": "1.64.1",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }

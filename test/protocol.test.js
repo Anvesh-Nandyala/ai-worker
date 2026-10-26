@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createApp } from '../server.js';
+import { startOllamaFixture } from './helpers/ollama-server.js';
 
 test('live controller preserves model content, reports tool failures and verifies before finishing', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-protocol-'));
@@ -41,3 +42,47 @@ test('live controller preserves model content, reports tool failures and verifie
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
+
+test('Ollama controller completes a verified task through native HTTP tools without a Gemini key', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-ollama-'));
+  const ollama = await startOllamaFixture();
+  const app = await createApp({ dataDirectory: directory, apiKey: '', defaultProvider: 'ollama', ollamaModel: 'test-model', ollamaBaseURL: ollama.baseURL });
+  try {
+    await app.listen(0);
+    const status = await (await fetch(app.manager.baseURL + '/api/ollama/status')).json();
+    assert.equal(status.ready, true);
+    const run = app.manager.create({ provider: 'ollama', task: 'Read and verify the project brief' });
+    const deadline = Date.now() + 30000;
+    while (!['completed', 'failed', 'stopped', 'blocked'].includes(run.status) && Date.now() < deadline) await delay(50);
+    assert.equal(run.status, 'completed', run.error);
+    assert.equal(run.view().model, 'test-model');
+    assert.equal(run.evidence[0].passed, true);
+    assert.equal(ollama.requests.filter(item => item.path === '/api/chat').length, 4);
+  } finally {
+    await app.close();
+    await ollama.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+for (const repeatPlain of [false, true]) {
+  test(`Ollama gets one completion reminder and ${repeatPlain ? 'stops without invented evidence if it still returns text' : 'can recover to real verification'}`, async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-ollama-reminder-'));
+    const ollama = await startOllamaFixture({ plainBeforeVerify: true, repeatPlain });
+    const app = await createApp({ dataDirectory: directory, apiKey: '', defaultProvider: 'ollama', ollamaModel: 'test-model', ollamaBaseURL: ollama.baseURL });
+    try {
+      await app.listen(0);
+      const run = app.manager.create({ provider: 'ollama', task: 'Read and verify the project brief' });
+      const deadline = Date.now() + 30000;
+      while (app.manager.active === run && Date.now() < deadline) await delay(50);
+      assert.equal(run.events.filter(event => event.title === 'Requesting verified completion').length, 1);
+      assert.equal(run.status, repeatPlain ? 'blocked' : 'completed', run.error);
+      if (repeatPlain) assert.equal(run.evidence.length, 0);
+      else assert.equal(run.evidence[0].passed, true);
+    } finally {
+      await app.close();
+      await ollama.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+}

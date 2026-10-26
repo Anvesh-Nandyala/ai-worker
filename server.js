@@ -6,6 +6,9 @@ import { randomUUID } from 'node:crypto';
 import { Workspace } from './src/files.js';
 import { RunManager } from './src/agent.js';
 import { PRESETS } from './src/providers.js';
+import { OllamaProvider } from './src/ollama.js';
+import { MAX_DOCUMENT_BYTES } from './src/document-formats.js';
+import { invoiceRecord, sameInvoice } from './src/demo-invoices.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const staticFiles = {
@@ -22,19 +25,30 @@ function json(response, status, data) {
   response.end(JSON.stringify(data));
 }
 
-async function body(request) {
-  let text = '';
+async function body(request, limit = 512 * 1024) {
+  const chunks = [];
+  let size = 0;
   for await (const chunk of request) {
-    text += chunk;
-    if (Buffer.byteLength(text) > 512 * 1024) throw new Error('Request body exceeds 512 KB');
+    size += chunk.length;
+    if (size > limit) throw new Error('Request body exceeds the allowed size');
+    chunks.push(chunk);
   }
-  return JSON.parse(text || '{}');
+  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
 }
 
 export async function createApp(options = {}) {
   const dataDirectory = path.resolve(options.dataDirectory || process.env.DATA_DIR || path.join(root, 'data'));
-  const workspace = new Workspace(path.join(dataDirectory, 'workspace'));
+  const fileAccess = options.fileAccess ?? process.env.FILE_ACCESS ?? 'workspace';
+  if (!['workspace', 'all'].includes(fileAccess)) throw new Error('FILE_ACCESS must be workspace or all');
+  const workspace = new Workspace(path.join(dataDirectory, 'workspace'), { allowAllFiles: fileAccess === 'all' });
   await workspace.init();
+  // Seed only bundled practice inputs; never replace the user's files.
+  const samples = path.join(root, 'fixtures', 'invoices');
+  for (const filename of await fs.readdir(samples)) {
+    const destination = await workspace.resolve('sample-invoices/' + filename, { createParents: true });
+    try { await fs.copyFile(path.join(samples, filename), destination, fs.constants.COPYFILE_EXCL); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
   for (const [filename, content] of Object.entries({
     'notes/project-brief.md': '# Project Orbit\n\nProject Orbit is a student-built collaboration tool for small engineering teams. Its first release brings tasks, project notes, and a searchable resource catalog into one workspace.\n\nThe first milestone is a usable local prototype with clear activity history and reliable saving. The team will validate it with three classmates before adding account sharing.\n\n## Next steps\n- Review release notes\n- Test the task form\n- Collect feedback\n',
     'notes/meeting-notes.md': '# Planning meeting\n\nOwner: Anvesh\nDecision: focus on browser tools and scoped file tools first.\nOpen question: should task notifications be daily or weekly?\n',
@@ -46,17 +60,37 @@ export async function createApp(options = {}) {
   const config = {
     apiKey: options.apiKey ?? process.env.GEMINI_API_KEY ?? '',
     model: options.model || process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+    ollamaModel: options.ollamaModel || process.env.OLLAMA_MODEL || 'qwen3.5:4b',
+    ollamaBaseURL: options.ollamaBaseURL || process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
+    ollamaTimeout: Math.max(1000, Math.min(300000, Number(process.env.OLLAMA_TIMEOUT_MS) || 120000)),
+    ollamaContextSize: Math.max(4096, Math.min(131072, Number(process.env.OLLAMA_CONTEXT_SIZE) || 16384)),
     headless: options.headless ?? process.env.HEADLESS !== 'false',
-    maxTurns: Math.max(3, Math.min(40, Number(process.env.MAX_MODEL_TURNS) || 20)),
+    maxTurns: Math.max(3, Math.min(40, Number(process.env.MAX_MODEL_TURNS) || 32)),
     maxToolCalls: Math.max(5, Math.min(100, Number(process.env.MAX_TOOL_CALLS) || 45)),
     maxMinutes: Math.max(1, Math.min(30, Number(process.env.MAX_RUN_MINUTES) || 10))
   };
+  config.defaultProvider = options.defaultProvider ?? process.env.AI_PROVIDER ?? (config.apiKey ? 'gemini' : 'demo');
+  if (!['gemini', 'ollama', 'demo'].includes(config.defaultProvider)) throw new Error('AI_PROVIDER must be ollama, gemini or demo');
+  new OllamaProvider({ model: config.ollamaModel, baseURL: config.ollamaBaseURL });
   const manager = new RunManager({ workspace, runsDirectory: path.join(dataDirectory, 'runs'), config, providerFactory: options.providerFactory });
   await manager.init();
   let demo = { tasks: [{ id: 'welcome', title: 'Explore the practice workspace', priority: 'Medium' }] };
   const demoPath = path.join(dataDirectory, 'demo.json');
   try { demo = JSON.parse(await fs.readFile(demoPath, 'utf8')); } catch {}
+  demo.invoices ||= [];
   let saveDemo = Promise.resolve();
+  const updateDemo = change => {
+    const operation = saveDemo.then(async () => {
+      const next = structuredClone(demo);
+      const result = change(next);
+      await fs.writeFile(demoPath + '.tmp', JSON.stringify(next, null, 2));
+      await fs.rename(demoPath + '.tmp', demoPath);
+      demo = next;
+      return result;
+    });
+    saveDemo = operation.catch(() => {});
+    return operation;
+  };
   const server = http.createServer(async (request, response) => {
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
@@ -76,8 +110,14 @@ export async function createApp(options = {}) {
       }
       if (method === 'GET' && url.pathname === '/api/config') return json(response, 200, {
         hasApiKey: Boolean(config.apiKey), model: config.model, maxTurns: config.maxTurns,
-        workspace: workspace.root, demoURL: manager.baseURL + '/demo', presets: PRESETS
+        workspace: workspace.root, fileAccess, homeDirectory: workspace.allowAllFiles ? workspace.home : undefined,
+        defaultProvider: config.defaultProvider, ollamaModel: config.ollamaModel,
+        demoURL: manager.baseURL + '/demo', presets: PRESETS
       });
+      if (method === 'GET' && url.pathname === '/api/ollama/status') {
+        try { return json(response, 200, await new OllamaProvider({ model: config.ollamaModel, baseURL: config.ollamaBaseURL }).check()); }
+        catch (error) { return json(response, 200, { ready: false, model: config.ollamaModel, error: error.message }); }
+      }
       if (method === 'GET' && url.pathname === '/api/runs') return json(response, 200, { runs: manager.list(), active: manager.active?.id });
       if (method === 'POST' && url.pathname === '/api/runs') {
         const run = manager.create(await body(request));
@@ -111,11 +151,21 @@ export async function createApp(options = {}) {
           return json(response, 200, { stopped: true });
         }
       }
-      if (method === 'GET' && url.pathname === '/api/workspace') return json(response, 200, { entries: await workspace.list(url.searchParams.get('path') || '.') });
+      if (method === 'GET' && url.pathname === '/api/workspace') {
+        const requested = url.searchParams.get('path') || '.';
+        const folder = workspace.allowAllFiles ? await workspace.resolve(requested) : requested;
+        return json(response, 200, { entries: await workspace.list(folder), path: folder, parent: workspace.allowAllFiles ? path.dirname(folder) : path.posix.dirname(folder) });
+      }
       if (method === 'GET' && url.pathname === '/api/workspace/file') return json(response, 200, await workspace.read(url.searchParams.get('path') || ''));
       if (method === 'POST' && url.pathname === '/api/workspace/upload') {
-        const input = await body(request);
+        const input = await body(request, Math.ceil(MAX_DOCUMENT_BYTES * 4 / 3) + 4096);
         if (typeof input.filename !== 'string' || !input.filename || input.filename !== path.basename(input.filename) || input.filename.includes('\\')) throw new Error('Use a simple filename');
+        if (input.encoding === 'base64') {
+          if (typeof input.data !== 'string' || input.data.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(input.data)) throw new Error('Upload valid base64 document data');
+          const bytes = Buffer.from(input.data, 'base64');
+          if (bytes.toString('base64') !== input.data) throw new Error('Upload valid base64 document data');
+          return json(response, 201, await workspace.importDocument(input.filename, bytes));
+        }
         if (typeof input.content !== 'string' || input.content.includes('\0')) throw new Error('Upload a UTF-8 text file');
         return json(response, 201, await workspace.write('imports/' + input.filename, input.content, false));
       }
@@ -123,17 +173,28 @@ export async function createApp(options = {}) {
       if (method === 'POST' && url.pathname === '/api/demo/tasks') {
         const input = await body(request);
         if (typeof input.title !== 'string' || !input.title.trim() || input.title.length > 180 || !['Low', 'Medium', 'High'].includes(input.priority)) throw new Error('Enter a title and valid priority');
-        if (demo.tasks.some(task => task.title === input.title.trim())) return json(response, 409, { error: 'A task with this title already exists' });
-        const task = { id: randomUUID(), title: input.title.trim(), priority: input.priority };
-        demo.tasks.push(task);
-        const serialized = JSON.stringify(demo, null, 2);
-        saveDemo = saveDemo.then(() => fs.writeFile(demoPath, serialized));
-        await saveDemo;
+        const task = await updateDemo(next => {
+          if (next.tasks.some(task => task.title === input.title.trim())) throw Object.assign(new Error('A task with this title already exists'), { status: 409 });
+          const task = { id: randomUUID(), title: input.title.trim(), priority: input.priority };
+          next.tasks.push(task);
+          return task;
+        });
         return json(response, 201, task);
+      }
+      if (method === 'GET' && url.pathname === '/api/demo/invoices') return json(response, 200, { invoices: demo.invoices });
+      if (method === 'POST' && url.pathname === '/api/demo/invoices') {
+        const record = invoiceRecord(await body(request));
+        const saved = await updateDemo(next => {
+          if (next.invoices.some(item => sameInvoice(item, record))) throw Object.assign(new Error('This company and invoice number already exist. Check the saved record before retrying.'), { status: 409 });
+          const saved = { id: randomUUID(), ...record, createdAt: new Date().toISOString() };
+          next.invoices.push(saved);
+          return saved;
+        });
+        return json(response, 201, saved);
       }
       return json(response, 404, { error: 'Route not found' });
     } catch (error) {
-      if (!response.headersSent) json(response, 400, { error: error.message });
+      if (!response.headersSent) json(response, error.status === 409 ? 409 : 400, { error: error.message });
       else response.end();
     }
   });
@@ -156,6 +217,7 @@ export async function createApp(options = {}) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const app = await createApp();
   const address = await app.listen();
-  console.log(`\nRelay AI Worker → ${address}\nWorkspace → ${app.workspace.root}\nGemini → ${app.manager.config.apiKey ? app.manager.config.model : 'no key configured; scripted demos are available'}\n`);
+  console.log(`\nRelay AI Worker → ${address}\nWorkspace → ${app.workspace.root}\nFile access → ${app.workspace.allowAllFiles ? 'all files allowed by your OS account' : 'workspace only'}\nGemini → ${app.manager.config.apiKey ? app.manager.config.model : 'no key configured; scripted demos are available'}\n`);
+  console.log(`Default mode → ${app.manager.config.defaultProvider}\nOllama → ${app.manager.config.ollamaModel} at ${app.manager.config.ollamaBaseURL}\n`);
   for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => { await app.close(); process.exit(0); });
 }
